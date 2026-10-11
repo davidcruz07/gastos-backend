@@ -3,6 +3,7 @@ import express from 'express';
 import rateLimit from 'express-rate-limit';
 import { GoogleGenAI, Type } from '@google/genai';
 import { createClient } from '@supabase/supabase-js';
+import { generarResumen, enviarTelegram, alertarSiInusual } from './resumen.js';
 
 /* ---------- configuración ---------- */
 const REQUERIDAS = ['GEMINI_API_KEY', 'SUPABASE_URL', 'SUPABASE_SERVICE_ROLE_KEY', 'WEBHOOK_SECRET', 'MY_USER_ID'];
@@ -109,6 +110,7 @@ async function procesar(texto, { guardarFallo = true } = {}) {
       throw error;
     }
     console.log(`Guardado: ${d.tipo} ${d.monto} ${d.moneda} en ${d.comercio}`);
+    alertarSiInusual(supabase, MY_USER_ID, d).catch((e) => console.error('Error en la alerta:', e.message));
     return true;
   } catch (err) {
     const mensaje = String(err?.message || err).slice(0, 500);
@@ -165,6 +167,46 @@ app.post('/api/reprocesar', limitador, async (req, res) => {
     }
   })().finally(() => pendientes.delete(tarea));
   pendientes.add(tarea);
+});
+
+// Resúmenes: los pide el cron (con el secreto) o el dashboard (con la sesión de Supabase).
+const TIPOS_RESUMEN = ['semanal', 'mes_en_curso', 'mes_anterior'];
+const ORIGEN_PERMITIDO = process.env.ALLOWED_ORIGIN;
+
+async function autorizadoResumen(req) {
+  if (autorizado(req)) return true;
+  const token = (req.get('authorization') || '').replace(/^Bearer\s+/i, '');
+  if (!token) return false;
+  const { data, error } = await supabase.auth.getUser(token);
+  return !error && data?.user?.id === MY_USER_ID;
+}
+
+app.use('/api/resumen', (req, res, next) => {
+  if (ORIGEN_PERMITIDO) {
+    res.set({
+      'Access-Control-Allow-Origin': ORIGEN_PERMITIDO,
+      'Access-Control-Allow-Headers': 'authorization, content-type, x-webhook-secret',
+      'Access-Control-Allow-Methods': 'POST, OPTIONS',
+    });
+  }
+  if (req.method === 'OPTIONS') return res.sendStatus(204);
+  next();
+});
+
+app.post('/api/resumen', limitador, async (req, res) => {
+  if (!(await autorizadoResumen(req))) return res.status(401).json({ error: 'No autorizado' });
+
+  const tipo = req.body?.tipo;
+  if (!TIPOS_RESUMEN.includes(tipo)) return res.status(400).json({ error: `"tipo" debe ser: ${TIPOS_RESUMEN.join(', ')}` });
+
+  try {
+    const r = await conTimeout(generarResumen({ supabase, ai, modelo: MODELO, userId: MY_USER_ID, tipo }), 45000);
+    const enviado = req.body?.enviar === false ? false : await enviarTelegram(r.texto);
+    res.json({ id: r.id, texto: r.texto, enviado });
+  } catch (err) {
+    console.error('Error generando resumen:', err?.message || err);
+    res.status(500).json({ error: 'No se pudo generar el resumen' });
+  }
 });
 
 app.use((err, _req, res, _next) => {
